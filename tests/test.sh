@@ -28,6 +28,7 @@ fail=0; check() { if eval "$2"; then echo "ok   $1"; else echo "FAIL $1"; fail=1
 px() { python3 -c "import struct,sys; d=open('$B/fb','rb').read(); x,y=$1,$2; print('%06x' % (struct.unpack_from('<I',d,(y*320+x)*4)[0] & 0xffffff))"; }
 check "status lists the waiting client, no owner" '[[ "$(get /status)" == *"\"owner\":0"*"\"name\":\"waiting plugin\""* ]]'
 check "test pattern takes the screen" '[ "$(get "/test?on=1")" = ok ] && sleep 0.3 && [ "$(px 5 50)" = ffffff ]'
+check "/snap returns the screen as shown (320x240x4, the test pattern)" '[ "$(curl -s -m 5 "http://127.0.0.1:$PORT/snap" | python3 -c "import struct,sys; d=sys.stdin.buffer.read(); print(len(d), \"%06x\" % (struct.unpack_from(\"<I\",d,(50*320+5)*4)[0] & 0xffffff))")" = "307200 ffffff" ]'
 ID=$(get /status | python3 -c 'import json,sys; print([c["id"] for c in json.load(sys.stdin)["clients"] if c["name"]=="waiting plugin"][0])')
 check "grant gives the waiting client the screen" '[ "$(get "/grant?id=$ID")" = ok ] && [ "$(px 160 120)" = 00aa00 ]'
 check "grant of an unknown client is refused" '[[ "$(get "/grant?id=999")" == *"no such client"* ]]'

@@ -474,6 +474,15 @@ static void jstr(char *out, size_t n, size_t *k, const char *s)
     if (*k < n) out[(*k)++] = '"';
 }
 
+int sdraw_snapshot(uint32_t *out)
+{
+    pthread_mutex_lock(&S.mu);
+    int r = S.px ? 0 : -1;
+    if (S.px) copy(out, SDRAW_W, S.px, S.pitch, FULL);
+    pthread_mutex_unlock(&S.mu);
+    return r;
+}
+
 int sdraw_status_json(char *out, size_t n)
 {
     size_t k = 0;

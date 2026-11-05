@@ -13,7 +13,9 @@ puts its pixels on the panel.
   saves MPC's new frame and paints the owner's layer over it. A client's `present()` copies its rectangle onto the screen
   and refreshes it on MPC's display fd (only the DRM master may). See mpc-vst-plugins docs/NOTES.md, 2026-11-04.
 - **Control** (on the device, `127.0.0.1:6740` by default; from a computer `ssh -L 6740:127.0.0.1:6740 root@<device>`):
-  `/status`, `/grant?id=N`, `/release`, `/cycle`, `/test?on=1|0` (a built-in test pattern).
+  `/status`, `/grant?id=N`, `/release`, `/cycle`, `/test?on=1|0` (a built-in test pattern), `/input?key=K|dial=N|knob=K&value=V`
+  (an event for the client with the screen, as if from the device) and `/snap` (the screen as shown: 320x240 pixels,
+  4 bytes each, 0x00RRGGBB little-endian, row-major), for checking pages without touching the device.
 - **Page button:** a long hold (800 ms) of PAD FX opens the home page (`page_home`, default `RACK`, the sample-rack addin's
   manager) and closes it again; a page the home page opened (`show()`) goes back to it. Without the home page open, or
   with `page_home=-`, it cycles: MPC, then each client in the order it opened, then MPC. A short press stays MPC's.

@@ -12,6 +12,7 @@
 const mpc_sdraw_api *mpc_sample_draw_api(int version);
 void sdraw_enable(void);                        /* start watching MPC's display calls (the constructor calls it) */
 int  sdraw_status_json(char *out, size_t n);    /* the clients, the owner and the display, for the control interface */
+int  sdraw_snapshot(uint32_t *out);             /* control: the screen as shown, SDRAW_W x SDRAW_H 0x00RRGGBB; -1 unmapped */
 int  sdraw_grant(int id);                       /* control: give client id the screen (it gets a focus callback) */
 void sdraw_take_back(void);                     /* control: give MPC its screen back (the owner gets a callback) */
 void sdraw_cycle(void);                         /* the page button: MPC <-> the home page (else MPC -> each client -> MPC) */

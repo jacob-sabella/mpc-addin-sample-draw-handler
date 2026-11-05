@@ -175,6 +175,17 @@ static void serve(int fd)
         int r = sdraw_grant(query_int(q, "id", -1));
         reply(fd, r ? "409 Conflict" : "200 OK", "text/plain",
               r == 0 ? "ok\n" : r == -1 ? "the display isn't known yet: MPC hasn't refreshed the screen since the addin started\n" : "no such client\n");
+    } else if (!strcmp(path, "/snap")) {   /* a remote look at the screen (tests, docs): raw 320x240 0x00RRGGBB, row-major */
+        static uint32_t px[SDRAW_W * SDRAW_H];
+        if (sdraw_snapshot(px)) { reply(fd, "409 Conflict", "text/plain", "the display isn't known yet\n"); return; }
+        char h[160];
+        int hn = snprintf(h, sizeof h, "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: %zu\r\nConnection: close\r\n\r\n", sizeof px);
+        if (write(fd, h, (size_t)hn) < 0) return;
+        for (size_t off = 0; off < sizeof px;) {
+            ssize_t w = write(fd, (const char *)px + off, sizeof px - off);
+            if (w <= 0) return;
+            off += (size_t)w;
+        }
     } else if (!strcmp(path, "/release")) {
         sdraw_take_back();
         reply(fd, "200 OK", "text/plain", "ok\n");
@@ -199,7 +210,7 @@ static void serve(int fd)
         } else { reply(fd, "400 Bad Request", "text/plain", "key=0-2, dial=N or knob=0-2&value=0-127\n"); return; }
         reply(fd, "200 OK", "text/plain", sdraw_input_wanted() ? "ok\n" : "ok (the client with the screen takes no input)\n");
     } else {
-        reply(fd, "404 Not Found", "text/plain", "/status /grant?id=N /release /cycle /test?on=1|0 /input?key=K|dial=N|knob=K&value=V\n");
+        reply(fd, "404 Not Found", "text/plain", "/status /grant?id=N /release /cycle /test?on=1|0 /input?key=K|dial=N|knob=K&value=V /snap\n");
     }
 }
 
