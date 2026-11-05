@@ -4,6 +4,12 @@ An addin for the MPC Sample that owns the screen on behalf of the plugins and ad
 plugin page, so a plugin built for it can draw a full-screen page of its own: the addin decides which plugin may draw and
 puts its pixels on the panel.
 
+![Stompbox's page on the MPC Sample: the dial steps presets, the buttons step sections, the knobs turn](docs/screenshots/stompbox-page.gif)
+
+<img src="docs/screenshots/keyscope-page.png" width="320" alt="Keyscope's page"> <img src="docs/screenshots/tuner-page.png" width="320" alt="Tuner's page">
+
+The pages above were captured on an MPC Sample with `/snap` while `/input` drove the dial, the buttons and the knobs.
+
 - **One owner at a time, the last to ask.** A plugin or another addin opens a client, draws into its own 320x240 layer and asks for the
   screen. It gets the whole screen at once (a previous owner is told it lost it) and keeps it until it releases it, when its
   page closes. Then MPC's screen comes back as MPC last drew it. Nothing is handed over by itself.
