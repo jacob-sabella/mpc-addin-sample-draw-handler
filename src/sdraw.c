@@ -49,6 +49,8 @@ struct mpc_sdraw_client {
     char name[48];
     mpc_sdraw_focus_fn focus;
     void *user;
+    mpc_sdraw_input_fn input; void *input_user;
+    int back;                      /* shown by client id back (show()): the page button returns there */
     uint32_t layer[SDRAW_W * SDRAW_H];
 };
 
@@ -72,6 +74,7 @@ static struct {
 } S = { .mu = PTHREAD_MUTEX_INITIALIZER, .fd = -1, .next_id = 1 };
 
 static int (*real_ioctl)(int, unsigned long, ...);
+static pthread_mutex_t deliver_mu = PTHREAD_MUTEX_INITIALIZER;   /* held while an input callback runs */
 
 static void resolve(void)
 {
@@ -239,12 +242,16 @@ static void tell(note *ns, int n)
 }
 
 /* Make c the owner (lock held). The notes get who to tell, outside the lock; self: c asked itself (no note for c). */
+static unsigned handovers;   /* times the screen changed hands (under S.mu): a release and request between two looks */
+
 static int give(mpc_sdraw_client *c, int self, note *ns, int *n)
 {
     if (!S.px) return -1;
     mpc_sdraw_client *prev = S.owner;
     if (!prev) copy(S.shadow, SDRAW_W, S.px, S.pitch, FULL);
     S.owner = c;
+    c->back = 0;
+    handovers++;
     copy(S.px, S.pitch, c->layer, SDRAW_W, FULL);
     refresh(FULL);
     if (prev && prev != c) ns[(*n)++] = (note){ prev, 0 };
@@ -285,6 +292,8 @@ static void api_close(mpc_sdraw_client *c)
     if (S.owner == c) restore();
     for (int i = 0; i < SDRAW_MAX_CLIENTS; i++) if (S.cl[i] == c) S.cl[i] = NULL;
     pthread_mutex_unlock(&S.mu);
+    pthread_mutex_lock(&deliver_mu);   /* a callback to c in progress finishes first */
+    pthread_mutex_unlock(&deliver_mu);
     free(c);
 }
 
@@ -331,10 +340,63 @@ static void api_present(mpc_sdraw_client *c, int x, int y, int w, int h)
     pthread_mutex_unlock(&S.mu);
 }
 
+static void api_set_input(mpc_sdraw_client *c, mpc_sdraw_input_fn fn, void *user)
+{
+    if (!c) return;
+    pthread_mutex_lock(&S.mu);
+    c->input = fn; c->input_user = user;
+    pthread_mutex_unlock(&S.mu);
+}
+
+int sdraw_input_wanted(void)
+{
+    pthread_mutex_lock(&S.mu);
+    int r = S.owner && S.owner->input;
+    pthread_mutex_unlock(&S.mu);
+    return r;
+}
+
+/* Lock order deliver_mu -> S.mu, as in a callback that calls the API. close() removes the client under S.mu and then
+ * waits on deliver_mu, so a client found here stays alive until its callback returns. */
+int sdraw_input_owner(unsigned *gen)
+{
+    pthread_mutex_lock(&S.mu);
+    int r = S.owner && S.owner->input ? S.owner->id : 0;
+    if (gen) *gen = handovers;
+    pthread_mutex_unlock(&S.mu);
+    return r;
+}
+
+void sdraw_deliver(const mpc_sdraw_event *e)
+{
+    pthread_mutex_lock(&deliver_mu);
+    pthread_mutex_lock(&S.mu);
+    mpc_sdraw_input_fn fn = S.owner ? S.owner->input : NULL;
+    void *user = S.owner ? S.owner->input_user : NULL;
+    pthread_mutex_unlock(&S.mu);
+    if (fn) fn(user, e);
+    pthread_mutex_unlock(&deliver_mu);
+}
+
+static int api_show(mpc_sdraw_client *c, const char *name)
+{
+    if (!c || !name) return -1;
+    note ns[2]; int n = 0, r = -1;
+    pthread_mutex_lock(&S.mu);
+    mpc_sdraw_client *t = NULL;
+    for (int i = 0; i < SDRAW_MAX_CLIENTS; i++)
+        if (S.cl[i] && S.cl[i] != c && !strcmp(S.cl[i]->name, name) && (!t || S.cl[i]->id > t->id)) t = S.cl[i];
+    if (t && give(t, 0, ns, &n) == 0) { t->back = c->id; r = 0; }
+    pthread_mutex_unlock(&S.mu);
+    tell(ns, n);
+    return r;
+}
+
 static const mpc_sdraw_api API = {
     .version = MPC_SDRAW_API_VERSION, .width = SDRAW_W, .height = SDRAW_H,
     .open = api_open, .close = api_close, .request = api_request, .release = api_release,
-    .has_screen = api_has_screen, .pixels = api_pixels, .present = api_present,
+    .has_screen = api_has_screen, .pixels = api_pixels, .present = api_present, .set_input = api_set_input,
+    .show = api_show,
 };
 
 __attribute__((visibility("default"))) const mpc_sdraw_api *mpc_sample_draw_api(int version)
@@ -364,6 +426,31 @@ int sdraw_grant(int id)
     pthread_mutex_unlock(&S.mu);
     tell(ns, n);
     return r;   /* 0, -1 no display yet, -2 no such client */
+}
+
+static char home_name[64] = "RACK";
+void sdraw_set_home(const char *name) { snprintf(home_name, sizeof home_name, "%s", name ? name : ""); }
+
+/* The page button. With the home page open (page_home, default RACK, the rack addin): MPC -> home -> MPC, and a page the
+ * home page showed (show()) goes back to it. Without one: MPC -> each client in open order -> MPC. */
+void sdraw_cycle(void)
+{
+    note ns[2]; int n = 0;
+    pthread_mutex_lock(&S.mu);
+    mpc_sdraw_client *next = NULL, *home = NULL;
+    int after = S.owner ? S.owner->id : 0;
+    for (int i = 0; i < SDRAW_MAX_CLIENTS && home_name[0]; i++)
+        if (S.cl[i] && !strcmp(S.cl[i]->name, home_name) && (!home || S.cl[i]->id < home->id)) home = S.cl[i];
+    if (S.owner && S.owner->back)   /* shown by another client: back to it */
+        for (int i = 0; i < SDRAW_MAX_CLIENTS; i++) if (S.cl[i] && S.cl[i]->id == S.owner->back) next = S.cl[i];
+    if (home) { if (!next && !S.owner) next = home; }   /* home open: it toggles; any other page closes */
+    else
+        for (int i = 0; i < SDRAW_MAX_CLIENTS && !next; i++)   /* the client with the lowest id above the owner's: open order */
+            if (S.cl[i] && S.cl[i]->id > after && (!next || S.cl[i]->id < next->id)) next = S.cl[i];
+    if (next) give(next, 0, ns, &n);
+    else if (S.owner) { ns[n++] = (note){ S.owner, 0 }; restore(); }
+    pthread_mutex_unlock(&S.mu);
+    tell(ns, n);
 }
 
 void sdraw_take_back(void)

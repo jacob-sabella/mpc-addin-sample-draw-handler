@@ -3,7 +3,11 @@
  *   GET /status         the clients, the owner and the display (JSON)
  *   GET /grant?id=N     give client N the screen
  *   GET /release        give MPC its screen back
- *   GET /test?on=1|0    open the test-pattern client and give it the screen, or close it */
+ *   GET /test?on=1|0    open the test-pattern client and give it the screen, or close it
+ *   GET /cycle          what the page button does: MPC -> first client -> next -> ... -> MPC
+ *   GET /input?key=K | ?dial=N | ?knob=K&value=V
+ *                       an input event for the client with the screen, as if from the soft key K (0-2, a press and
+ *                       release), N dial steps or knob K at V (0-127): to drive a page without touching the device */
 #define _GNU_SOURCE
 #include "sdraw_int.h"
 #include <arpa/inet.h>
@@ -21,7 +25,23 @@
 #include <unistd.h>
 #include <dlfcn.h>
 
-static struct { int enabled, port; char bind[80]; } C = { 1, 6740, "127.0.0.1" };
+static struct { int enabled, port, page_note, page_hold_ms, log_buttons; char bind[80]; int keys[4], knobs[3], dial_cc; } C = {
+    1, 6740, 1, 800, 1, "127.0.0.1", { 12, 13, 14, 111 }, { 16, 17, 18 }, 100 };
+
+/* "a,b,c": three numbers 0-127, or -1 for none */
+static void three(const char *v, int out[3])
+{
+    int t[3] = { -1, -1, -1 }, n = 0;
+    for (const char *p = v; *p && n < 3; ) {
+        char *e; long x = strtol(p, &e, 10);
+        if (e == p) break;
+        if (x < -1 || x > 127) return;
+        t[n++] = (int)x;
+        p = *e == ',' ? e + 1 : e;
+        if (!*e) break;
+    }
+    if (n) for (int i = 0; i < 3; i++) out[i] = t[i];
+}
 
 static void conf_load(const char *path)
 {
@@ -37,6 +57,14 @@ static void conf_load(const char *path)
         if (!strcmp(k, "enabled")) C.enabled = atoi(v) != 0;
         else if (!strcmp(k, "port")) { int n = atoi(v); if (n > 0 && n < 65536) C.port = n; }
         else if (!strcmp(k, "bind")) snprintf(C.bind, sizeof C.bind, "%s", v);
+        else if (!strcmp(k, "page_note")) { int n = atoi(v); if (n >= -1 && n < 128) C.page_note = n; }
+        else if (!strcmp(k, "page_home")) sdraw_set_home(strcmp(v, "-") ? v : "");
+        else if (!strcmp(k, "page_hold_ms")) { int n = atoi(v); if (n >= 200 && n <= 5000) C.page_hold_ms = n; }
+        else if (!strcmp(k, "soft_keys")) three(v, C.keys);
+        else if (!strcmp(k, "knobs")) three(v, C.knobs);
+        else if (!strcmp(k, "dial_press")) { int n = atoi(v); if (n >= -1 && n < 128) C.keys[3] = n; }
+        else if (!strcmp(k, "dial_cc")) { int n = atoi(v); if (n >= -1 && n < 128) C.dial_cc = n; }
+        else if (!strcmp(k, "log_buttons")) { int l = atoi(v); C.log_buttons = l < 0 ? 0 : l > 2 ? 2 : l; }
         else LOG("%s: unknown key %s\n", path, k);
     }
     fclose(f);
@@ -150,12 +178,28 @@ static void serve(int fd)
     } else if (!strcmp(path, "/release")) {
         sdraw_take_back();
         reply(fd, "200 OK", "text/plain", "ok\n");
+    } else if (!strcmp(path, "/cycle")) {
+        sdraw_cycle();
+        reply(fd, "200 OK", "text/plain", "ok\n");
     } else if (!strcmp(path, "/test")) {
         int r = test_set(query_int(q, "on", 1) != 0);
         reply(fd, r ? "409 Conflict" : "200 OK", "text/plain",
               r == 0 ? "ok\n" : r == -2 ? "the display isn't known yet: MPC hasn't refreshed the screen since the addin started\n" : "no screen\n");
+    } else if (!strcmp(path, "/input")) {
+        int key = query_int(q, "key", -1), dial = query_int(q, "dial", 0), knob = query_int(q, "knob", -1);
+        if (key >= 0 && key < 4) {
+            mpc_sdraw_event e = { MPC_SDRAW_EV_KEY, key, 1 }; sdraw_deliver(&e);
+            e.value = 0; sdraw_deliver(&e);
+        } else if (dial) {
+            mpc_sdraw_event e = { MPC_SDRAW_EV_DIAL, 0, dial }; sdraw_deliver(&e);
+        } else if (knob >= 0 && knob < 3) {
+            int v = query_int(q, "value", -1);
+            if (v < 0 || v > 127) { reply(fd, "400 Bad Request", "text/plain", "knob needs value=0-127\n"); return; }
+            mpc_sdraw_event e = { MPC_SDRAW_EV_KNOB, knob, v }; sdraw_deliver(&e);
+        } else { reply(fd, "400 Bad Request", "text/plain", "key=0-2, dial=N or knob=0-2&value=0-127\n"); return; }
+        reply(fd, "200 OK", "text/plain", sdraw_input_wanted() ? "ok\n" : "ok (the client with the screen takes no input)\n");
     } else {
-        reply(fd, "404 Not Found", "text/plain", "/status /grant?id=N /release /test?on=1|0\n");
+        reply(fd, "404 Not Found", "text/plain", "/status /grant?id=N /release /cycle /test?on=1|0 /input?key=K|dial=N|knob=K&value=V\n");
     }
 }
 
@@ -219,8 +263,11 @@ __attribute__((visibility("default"))) int mpc_sample_draw_handler_start(void)
     if (!C.enabled) { LOG("disabled in %s\n", path); return -1; }
     sdraw_enable();
     A = mpc_sample_draw_api(MPC_SDRAW_API_VERSION);
+    input_controls(C.keys, C.knobs, C.dial_cc);
+    if (C.page_note >= 0) { input_config(C.page_note, C.page_hold_ms, C.log_buttons); input_enable(); }
     start_server();
-    LOG("%s: control on http://%s:%d/ (status, grant, release, test)\n", ADDIN_VERSION, C.bind, C.port);
+    LOG("%s: control on http://%s:%d/ (status, grant, release, test); page button: note %d held %d ms\n", ADDIN_VERSION, C.bind,
+        C.port, C.page_note, C.page_hold_ms);
     return 0;
 }
 

@@ -4,4 +4,4 @@ ADDIN_NAME="MPC Sample draw handler addin"
 ADDIN_SO=mpc_sample_draw_handler.so
 ADDIN_CONF=mpc_sample_draw_handler.conf
 ADDIN_FILES=""
-ADDIN_DONE="On the MPC Sample it now owns the screen for plugins that draw on it. Control (on the device): http://127.0.0.1:6740/status, /test?on=1 shows a test pattern, /release gives MPC its screen back. From a computer: ssh -L 6740:127.0.0.1:6740 root@<device address>."
+ADDIN_DONE="On the MPC Sample it now owns the screen for plugins and addins that draw on it; a long hold of PAD FX cycles their pages. Control (on the device): http://127.0.0.1:6740/status, /test?on=1 shows a test pattern, /release gives MPC its screen back. From a computer: ssh -L 6740:127.0.0.1:6740 root@<device address>."

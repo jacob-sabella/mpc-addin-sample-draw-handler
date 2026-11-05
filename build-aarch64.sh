@@ -6,7 +6,7 @@ cd "$(dirname "$0")"
 mkdir -p build/aarch64
 VER=$(cat VERSION)
 F="-std=gnu11 -O2 -Wall -Wextra -Werror -mcpu=cortex-a55 -DADDIN_VERSION=\"$VER\""
-O="-fPIC -shared -fvisibility=hidden -Wl,-z,defs -Wl,--as-needed -o build/aarch64/mpc_sample_draw_handler.so src/sdraw.c src/ctl.c -ldl -lpthread"
+O="-fPIC -shared -fvisibility=hidden -Wl,-z,defs -Wl,--as-needed -o build/aarch64/mpc_sample_draw_handler.so src/sdraw.c src/ctl.c src/input.c -ldl -lpthread"
 if command -v aarch64-linux-gnu-gcc >/dev/null && [ -z "${DOCKER:-}" ]; then
   # shellcheck disable=SC2086
   aarch64-linux-gnu-gcc $F $O && aarch64-linux-gnu-strip --strip-unneeded build/aarch64/mpc_sample_draw_handler.so

@@ -1,10 +1,10 @@
 # mpc-addin-sample-draw-handler
 
-An addin for the MPC Sample that owns the screen on behalf of plugins that draw on it. MPC's own UI on the Sample has no
+An addin for the MPC Sample that owns the screen on behalf of the plugins and addins that draw on it. MPC's own UI on the Sample has no
 plugin page, so a plugin built for it can draw a full-screen page of its own: the addin decides which plugin may draw and
 puts its pixels on the panel.
 
-- **One owner at a time, the last to ask.** A plugin opens a client, draws into its own 320x240 layer and asks for the
+- **One owner at a time, the last to ask.** A plugin or another addin opens a client, draws into its own 320x240 layer and asks for the
   screen. It gets the whole screen at once (a previous owner is told it lost it) and keeps it until it releases it, when its
   page closes. Then MPC's screen comes back as MPC last drew it. Nothing is handed over by itself.
 - **No link dependency.** The interface is `src/mpc_sample_draw.h`; a plugin looks up `mpc_sample_draw_api` with `dlsym`, so
@@ -13,7 +13,12 @@ puts its pixels on the panel.
   saves MPC's new frame and paints the owner's layer over it. A client's `present()` copies its rectangle onto the screen
   and refreshes it on MPC's display fd (only the DRM master may). See mpc-vst-plugins docs/NOTES.md, 2026-11-04.
 - **Control** (on the device, `127.0.0.1:6740` by default; from a computer `ssh -L 6740:127.0.0.1:6740 root@<device>`):
-  `/status`, `/grant?id=N`, `/release`, `/test?on=1|0` (a built-in test pattern).
+  `/status`, `/grant?id=N`, `/release`, `/cycle`, `/test?on=1|0` (a built-in test pattern).
+- **Page button:** a long hold (800 ms) of PAD FX opens the home page (`page_home`, default `RACK`, the sample-rack addin's
+  manager) and closes it again; a page the home page opened (`show()`) goes back to it. Without the home page open, or
+  with `page_home=-`, it cycles: MPC, then each client in the order it opened, then MPC. A short press stays MPC's.
+  The hold never reaches MPC; a short press does, when the button is let go. `page_note`, `page_hold_ms`, `log_buttons` in
+  the settings.
 
 Only starts in the MPC Sample's process (`/usr/bin/MPC Sample`). Settings: `mpc_sample_draw_handler.conf` next to the
 library (`enabled`, `bind`, `port`).

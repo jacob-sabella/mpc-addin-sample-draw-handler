@@ -1,22 +1,25 @@
 #!/usr/bin/env bash
 # Host tests (x86): the addin preloaded into a stand-in "MPC Sample" (tests/fake_mpc.c) with a file as the framebuffer,
-# under ASan+UBSan: ownership, painting over MPC's refreshes, restore on release, pass-through; then the control
+# under ASan+UBSan: ownership, painting over MPC's refreshes, restore on release, pass-through; the page button
+# (a FIFO plays the control surface); then the control
 # interface (status, test pattern, grant, release); and that it stays out of a process with another name.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 B=build/host; mkdir -p "$B"
 VER="-DADDIN_VERSION=\"$(cat VERSION)\""
 SAN="-fsanitize=address,undefined -fno-omit-frame-pointer -g"
-cc -std=gnu11 -O1 -Wall -Wextra -Werror $SAN -fPIC -shared -fvisibility=hidden $VER -o "$B/sdraw.so" src/sdraw.c src/ctl.c -ldl -lpthread
+cc -std=gnu11 -O1 -Wall -Wextra -Werror $SAN -fPIC -shared -fvisibility=hidden $VER -o "$B/sdraw.so" src/sdraw.c src/ctl.c src/input.c -ldl -lpthread
 cc -std=gnu11 -O1 -Wall -Wextra $SAN -o "$B/MPC Sample" tests/fake_mpc.c -ldl
 cp "$B/MPC Sample" "$B/other"
 head -c $((320 * 240 * 4)) /dev/zero > "$B/fb"
 PORT=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1])')
-printf 'enabled=1\nbind=127.0.0.1\nport=%s\n' "$PORT" > "$B/test.conf"
+printf 'enabled=1\nbind=127.0.0.1\nport=%s\npage_note=0\n' "$PORT" > "$B/test.conf"
 ASAN="$(cc -print-file-name=libasan.so)"
 run() { MPC_SDRAW_CONF="$B/test.conf" MPC_SDRAW_TEST_FB="$B/fb" ASAN_OPTIONS=detect_leaks=0 LD_PRELOAD="$ASAN:$PWD/$B/sdraw.so" "$@"; }
 run "$B/MPC Sample"
 run "$B/other" none
+rm -f "$B/surface.fifo"; mkfifo "$B/surface.fifo"
+MPC_SDRAW_TEST_SURFACE="$PWD/$B/surface.fifo" run "$B/MPC Sample" input 2>&1 | grep -v "button: note"
 # the control interface, with one client waiting
 run "$B/MPC Sample" wait > "$B/wait.log" 2>&1 & P=$!
 for _ in $(seq 50); do grep -q ready "$B/wait.log" 2>/dev/null && break; sleep 0.1; done
