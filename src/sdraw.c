@@ -8,8 +8,14 @@
  * While a client owns the screen, each refresh MPC asks for first saves MPC's new pixels of that rectangle into a shadow
  * copy, then paints the owner's layer over them, so the refresh sends the owner's pixels. The owner's own present() copies
  * its rectangle in and refreshes it on MPC's fd. Release puts the shadow back and refreshes the whole screen: MPC's screen
- * as it last drew it. Known gap: pixels MPC paints and an owner's present() overwrites before MPC's refresh never reach
- * the shadow; they show the owner's pixels after release until MPC redraws them. */
+ * as it last drew it.
+ *
+ * MPC double-buffers (two dumb framebuffers, page flips between them) and redraws only what changed into the one going out
+ * next. So each framebuffer has its own shadow: a flip saves the incoming buffer whole (MPC's frame) before painting the
+ * layer over it, and once the flip is queued the buffer that went off screen gets its shadow back, so MPC's next partial
+ * redraw lands on its own pixels (seen on the panel, 2026-11-06: with one shadow, the page stayed on the glass after
+ * release wherever MPC didn't redraw, under MPC's waveform). Known gap: pixels MPC paints and an owner's present()
+ * overwrites before MPC's refresh never reach the shadow. */
 #define _GNU_SOURCE
 #include "sdraw_int.h"
 #include <dlfcn.h>
@@ -58,9 +64,11 @@ static struct {
     pthread_mutex_t mu;
     atomic_int on;                 /* sdraw_enable() was called */
     int fd;                        /* MPC's display fd (from its refreshes), -1 until seen */
-    uint32_t fb;                   /* the framebuffer MPC refreshes */
+    uint32_t fb;                   /* the framebuffer MPC refreshes or flipped to last */
     uint32_t *px; size_t len; int pitch;   /* that framebuffer, mapped (pitch in pixels) */
-    uint32_t shadow[SDRAW_W * SDRAW_H];    /* MPC's screen while a client owns it */
+    uint32_t *shadow;              /* its MPC pixels while a client owns the screen */
+    int *painted;                  /* 1: it holds the layer, its MPC pixels are in shadow */
+    struct sbuf { uint32_t fb; uint32_t *px; size_t len; int pitch; uint32_t *shadow; int painted; long long used; } buf[4];
     struct mpc_sdraw_client *cl[SDRAW_MAX_CLIENTS];
     struct mpc_sdraw_client *owner;
     int next_id;
@@ -89,19 +97,42 @@ static long long now_ms(void)
 }
 
 /* ---- the framebuffer ---- */
-static void unmap_fb(void)
+static void use_buf(struct sbuf *b)
 {
-    if (S.px) munmap(S.px, S.len);
-    S.px = NULL; S.len = 0; S.fb = 0;
+    b->used = now_ms();
+    S.fb = b->fb; S.px = b->px; S.len = b->len; S.pitch = b->pitch; S.shadow = b->shadow; S.painted = &b->painted;
 }
 
-/* Map MPC's framebuffer fb (lock held). 0 when mapped. */
+static void after_flip(uint32_t fb);
+
+/* Map MPC's framebuffer fb (lock held) and make it the current one. 0 when mapped. Up to four stay mapped. */
+static int map_fb_new(uint32_t fb);
 static int map_fb(uint32_t fb)
 {
-    if (S.px && S.fb == fb) return 0;
-    unmap_fb();
+    struct sbuf *b = NULL, *old = &S.buf[0];
+    for (int i = 0; i < 4; i++) {
+        if (S.buf[i].px && S.buf[i].fb == fb) { use_buf(&S.buf[i]); return 0; }
+        if (!S.buf[i].px && !b) b = &S.buf[i];
+        if (S.buf[i].used < old->used) old = &S.buf[i];
+    }
+    if (!b) { b = old; munmap(b->px, b->len); b->px = NULL; }   /* the one used longest ago */
+    if (!b->shadow && !(b->shadow = calloc(SDRAW_W * SDRAW_H, 4))) { snprintf(S.err, sizeof S.err, "out of memory"); return -1; }
+    S.px = NULL;
+    if (map_fb_new(fb)) return -1;
+    b->fb = S.fb; b->px = S.px; b->len = S.len; b->pitch = S.pitch; b->painted = 0;
+    use_buf(b);
+    return 0;
+}
+
+/* Map fb into S.px/len/pitch/fb (lock held). 0 when mapped. */
+static int map_fb_new(uint32_t fb)
+{
     if (S.test_fb) {
-        int f = open(S.test_fb, O_RDWR | O_CLOEXEC);
+        char path[512];   /* "%u" in the name: one file per framebuffer id (double-buffering tests) */
+        const char *pc = strstr(S.test_fb, "%u");
+        if (pc) snprintf(path, sizeof path, "%.*s%u%s", (int)(pc - S.test_fb), S.test_fb, fb, pc + 2);
+        else snprintf(path, sizeof path, "%s", S.test_fb);
+        int f = open(path, O_RDWR | O_CLOEXEC);
         if (f < 0) { snprintf(S.err, sizeof S.err, "test framebuffer: %s", strerror(errno)); return -1; }
         S.len = (size_t)SDRAW_W * SDRAW_H * 4;
         void *p = mmap(NULL, S.len, PROT_READ | PROT_WRITE, MAP_SHARED, f, 0);
@@ -172,8 +203,10 @@ static const rect FULL = { 0, 0, SDRAW_W, SDRAW_H };
 static void cover(rect r)
 {
     if (empty(r)) return;
+    if (!*S.painted) r = FULL;   /* first paint of this buffer: keep all of MPC's frame */
     copy(S.shadow, SDRAW_W, S.px, S.pitch, r);
     copy(S.px, S.pitch, S.owner->layer, SDRAW_W, r);
+    *S.painted = 1;
 }
 
 /* ---- MPC's display calls ---- */
@@ -228,6 +261,17 @@ __attribute__((visibility("default"))) int ioctl(int fd, unsigned long req, ...)
             on_mpc_drm(fd, nr, arg);
             pthread_mutex_unlock(&S.mu);
         }
+        if ((nr == NR_PAGE_FLIP || nr == NR_SETCRTC) && arg) {
+            uint32_t fb = nr == NR_PAGE_FLIP ? ((const struct drm_mode_crtc_page_flip *)arg)->fb_id
+                                             : ((const struct drm_mode_crtc_head *)arg)->fb_id;
+            int r = real_ioctl(fd, req, arg);
+            if ((r == 0 || S.test_fb) && fb) {   /* tests: the "display" is a pipe, the flip itself fails */
+                pthread_mutex_lock(&S.mu);
+                after_flip(fb);
+                pthread_mutex_unlock(&S.mu);
+            }
+            return r;
+        }
     }
     return real_ioctl(fd, req, arg);
 }
@@ -248,7 +292,8 @@ static int give(mpc_sdraw_client *c, int self, note *ns, int *n)
 {
     if (!S.px) return -1;
     mpc_sdraw_client *prev = S.owner;
-    if (!prev) copy(S.shadow, SDRAW_W, S.px, S.pitch, FULL);
+    if (!*S.painted) copy(S.shadow, SDRAW_W, S.px, S.pitch, FULL);
+    *S.painted = 1;
     S.owner = c;
     c->back = 0;
     handovers++;
@@ -263,9 +308,24 @@ static int give(mpc_sdraw_client *c, int self, note *ns, int *n)
 static void restore(void)
 {
     S.owner = NULL;
-    if (!S.px) return;
-    copy(S.px, S.pitch, S.shadow, SDRAW_W, FULL);
-    refresh(FULL);
+    for (int i = 0; i < 4; i++) {
+        struct sbuf *b = &S.buf[i];
+        if (!b->px || !b->painted) continue;
+        copy(b->px, b->pitch, b->shadow, SDRAW_W, FULL);
+        b->painted = 0;
+    }
+    if (S.px) refresh(FULL);
+}
+
+/* After MPC's flip to fb went out (lock held): the other buffers get MPC's pixels back before MPC draws into them. */
+static void after_flip(uint32_t fb)
+{
+    for (int i = 0; i < 4; i++) {
+        struct sbuf *b = &S.buf[i];
+        if (!b->px || !b->painted || b->fb == fb) continue;
+        copy(b->px, b->pitch, b->shadow, SDRAW_W, FULL);
+        b->painted = 0;
+    }
 }
 
 /* ---- the API ---- */

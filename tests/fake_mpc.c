@@ -36,8 +36,51 @@ static void mpc_refresh(int x0, int y0, int w, int h)
 static mpc_sdraw_event in_ev[16]; static volatile int n_in;
 static void on_input(void *u, const mpc_sdraw_event *e) { (void)u; if (n_in < 16) in_ev[n_in] = *e; n_in++; }
 
+struct drm_mode_crtc_page_flip { unsigned crtc_id, fb_id, flags, reserved; unsigned long long user_data; };
+#define PAGE_FLIP _IOWR('d', 0xB0, struct drm_mode_crtc_page_flip)
+static void mpc_flip(unsigned id) { struct drm_mode_crtc_page_flip pf = { .fb_id = id }; ioctl(dfd, PAGE_FLIP, &pf); }
+static unsigned *map_file(const char *path) { int f = open(path, O_RDWR); return f < 0 ? NULL : mmap(NULL, W * H * 4, PROT_READ | PROT_WRITE, MAP_SHARED, f, 0); }
+static int has(const unsigned *b, unsigned col) { for (int i = 0; i < W * H; i++) if (b[i] == col) return 1; return 0; }
+
+/* MPC double-buffered, as on the Sample: two framebuffers, page flips between them, and each frame redraws only what
+ * changed (into the buffer going out next, which still holds the frame before last). MPC_SDRAW_TEST_FB has "%u". */
+static int flip_test(const mpc_sdraw_api *A, const char *pat)
+{
+    char p1[512], p2[512];
+    const char *pc = strstr(pat, "%u");
+    snprintf(p1, sizeof p1, "%.*s1%s", (int)(pc - pat), pat, pc + 2);
+    snprintf(p2, sizeof p2, "%.*s2%s", (int)(pc - pat), pat, pc + 2);
+    unsigned *b1 = map_file(p1), *b2 = map_file(p2);
+    if (!b1 || !b2) { printf("FAIL the two framebuffer files\n"); return 1; }
+    for (int i = 0; i < W * H; i++) b1[i] = b2[i] = 0x111111;
+    mpc_flip(1);                                                  /* frame 0 on buffer 1 */
+    mpc_sdraw_client *c = A->open("page", NULL, NULL);
+    int st; unsigned *l = A->pixels(c, &st); for (int i = 0; i < W * H; i++) l[i] = 0xAA0000;
+    CHECK(A->request(c) == 0, "flip: the page gets the screen");
+    fb = b2; paint(10, 10, 50, 50, 0x222222); mpc_flip(2);       /* frame 1: buffer 2 had frame 0, plus the change */
+    CHECK(all(0, 0, W, H, 0xAA0000), "flip: buffer 2 goes out with the page");
+    CHECK(!has(b1, 0xAA0000) && b1[0] == 0x111111, "flip: buffer 1, off screen, has MPC's frame 0 back");
+    fb = b1; paint(10, 10, 50, 50, 0x222222); paint(200, 200, 50, 30, 0x333333); mpc_flip(1);   /* frame 2 */
+    CHECK(!has(b2, 0xAA0000), "flip: buffer 2, off screen, has MPC's frame 1 back");
+    fb = b2; paint(200, 200, 50, 30, 0x333333); paint(100, 100, 10, 10, 0x444444); mpc_flip(2); /* frame 3 */
+    A->release(c);
+    fb = b2;
+    CHECK(!has(b1, 0xAA0000) && !has(b2, 0xAA0000), "flip: release leaves no page pixels in either buffer");
+    CHECK(all(0, 0, 10, 10, 0x111111) && all(10, 10, 50, 50, 0x222222) && all(200, 200, 50, 30, 0x333333) &&
+          all(100, 100, 10, 10, 0x444444), "flip: release shows MPC's latest frame whole");
+    A->close(c);
+    printf(fails ? "FAILED\n" : "PASSED\n");
+    return fails != 0;
+}
+
 int main(int argc, char **argv)
 {
+    if (argc > 1 && !strcmp(argv[1], "flip")) {
+        int p[2]; pipe(p); dfd = p[0];
+        const mpc_sdraw_api *(*g)(int) = (const mpc_sdraw_api *(*)(int))dlsym(RTLD_DEFAULT, MPC_SDRAW_ENTRY);
+        const mpc_sdraw_api *A = g ? g(MPC_SDRAW_API_VERSION) : NULL;
+        return A ? flip_test(A, getenv("MPC_SDRAW_TEST_FB")) : 1;
+    }
     int f = open(getenv("MPC_SDRAW_TEST_FB"), O_RDWR);
     fb = mmap(NULL, W * H * 4, PROT_READ | PROT_WRITE, MAP_SHARED, f, 0);
     int p[2]; pipe(p); dfd = p[0];

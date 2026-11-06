@@ -18,6 +18,8 @@ ASAN="$(cc -print-file-name=libasan.so)"
 run() { MPC_SDRAW_CONF="$B/test.conf" MPC_SDRAW_TEST_FB="$B/fb" ASAN_OPTIONS=detect_leaks=0 LD_PRELOAD="$ASAN:$PWD/$B/sdraw.so" "$@"; }
 run "$B/MPC Sample"
 run "$B/other" none
+head -c $((320 * 240 * 4)) /dev/zero > "$B/fb1"; head -c $((320 * 240 * 4)) /dev/zero > "$B/fb2"
+MPC_SDRAW_CONF="$B/test.conf" MPC_SDRAW_TEST_FB="$B/fb%u" ASAN_OPTIONS=detect_leaks=0 LD_PRELOAD="$ASAN:$PWD/$B/sdraw.so" "$B/MPC Sample" flip
 rm -f "$B/surface.fifo"; mkfifo "$B/surface.fifo"
 MPC_SDRAW_TEST_SURFACE="$PWD/$B/surface.fifo" run "$B/MPC Sample" input 2>&1 | grep -v "button: note"
 # the control interface, with one client waiting
