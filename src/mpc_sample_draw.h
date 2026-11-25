@@ -25,7 +25,7 @@
 #include <stdint.h>
 
 #define MPC_SDRAW_ENTRY "mpc_sample_draw_api"
-#define MPC_SDRAW_API_VERSION 3   /* 2 added set_input, 3 show and the dial press; asking for an older version gets the same struct */
+#define MPC_SDRAW_API_VERSION 4   /* 2 added set_input, 3 show and the dial press, 4 list and show_id; asking for an older version gets the same struct */
 
 typedef struct mpc_sdraw_client mpc_sdraw_client;
 
@@ -46,6 +46,9 @@ enum {
 typedef struct { int type, id, value; } mpc_sdraw_event;
 /* Runs on the addin's own thread, never with its lock held: may call the API (not close). Keep it short. */
 typedef void (*mpc_sdraw_input_fn)(void *user, const mpc_sdraw_event *e);
+
+/* An open client, as list() reports it (API version 4). */
+typedef struct { int id; char name[48]; } mpc_sdraw_info;
 
 typedef struct {
     int version;              /* MPC_SDRAW_API_VERSION of the addin */
@@ -81,6 +84,12 @@ typedef struct {
      * it has the screen, the page button goes back to c instead of cycling on. 0, or -1 (no such client, or no display
      * yet). */
     int (*show)(mpc_sdraw_client *c, const char *name);
+
+    /* Version 4: the open clients other than c, oldest first, up to max of them into out. Returns how many there are
+     * (more than max when out was too short). Ids are never reused, so a client found here can be named to show_id. */
+    int (*list)(mpc_sdraw_client *c, mpc_sdraw_info *out, int max);
+    /* Version 4: show() by id, for clients that share a name (MPC can run a plugin more than once). 0, or -1. */
+    int (*show_id)(mpc_sdraw_client *c, int id);
 } mpc_sdraw_api;
 
 #endif

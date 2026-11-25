@@ -18,8 +18,13 @@ The pages above were captured on an MPC Sample with `/snap` while `/input` drove
 - **How:** the addin wraps `ioctl` in MPC. MPC double-buffers and page-flips when its UI changes; on each flip the addin
   saves MPC's new frame and paints the owner's layer over it. A client's `present()` copies its rectangle onto the screen
   and refreshes it on MPC's display fd (only the DRM master may). See mpc-vst-plugins docs/NOTES.md, 2026-11-04.
+  MPC Sample 1.4 presents with DRM atomic commits instead of page flips; the addin follows those the same way (1.1,
+  device 2026-11-24). A `present()` refreshes only the rows that changed since the last one, in separate bands, because
+  each refresh of the SPI panel holds back MPC's audio while it runs.
+- **Listing pages** (API 4, 1.1): `list()` gives the other open clients with their ids and `show_id()` shows one by id,
+  for pages that share a name (MPC 1.4 makes two instances of a pad's Knob FX). Older clients keep working unchanged.
 - **Control** (on the device, `127.0.0.1:6740` by default; from a computer `ssh -L 6740:127.0.0.1:6740 root@<device>`):
-  `/status`, `/grant?id=N`, `/release`, `/cycle`, `/test?on=1|0` (a built-in test pattern), `/input?key=K|dial=N|knob=K&value=V`
+  `/status` (with refresh counts and time spent refreshing), `/grant?id=N`, `/release`, `/cycle`, `/test?on=1|0` (a built-in test pattern), `/input?key=K|dial=N|knob=K&value=V`
   (an event for the client with the screen, as if from the device) and `/snap` (the screen as shown: 320x240 pixels,
   4 bytes each, 0x00RRGGBB little-endian, row-major), for checking pages without touching the device.
 - **Page button:** a long hold (800 ms) of PAD FX opens the home page (`page_home`, default `RACK`, the sample-rack addin's

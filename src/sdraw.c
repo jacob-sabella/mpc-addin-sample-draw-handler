@@ -39,10 +39,23 @@ struct drm_clip_rect { unsigned short x1, y1, x2, y2; };
 struct drm_mode_fb_dirty_cmd { uint32_t fb_id, flags, color, num_clips; uint64_t clips_ptr; };
 struct drm_mode_crtc_page_flip { uint32_t crtc_id, fb_id, flags, reserved; uint64_t user_data; };
 struct drm_mode_crtc_head { uint64_t set_connectors_ptr; uint32_t count_connectors, crtc_id, fb_id; };
+struct drm_mode_atomic { uint32_t flags, count_objs; uint64_t objs_ptr, count_props_ptr, props_ptr, prop_values_ptr, reserved, user_data; };
+struct drm_mode_get_property { uint64_t values_ptr, enum_blob_ptr; uint32_t prop_id, flags; char name[32]; uint32_t count_values, count_enum_blobs; };
+struct drm_mode_get_blob { uint32_t blob_id, length; uint64_t data; };
+struct drm_mode_create_blob { uint64_t data; uint32_t length, blob_id; };
+struct drm_mode_destroy_blob { uint32_t blob_id; };
+struct drm_mode_rect { int32_t x1, y1, x2, y2; };
 #define DRM_TYPE 'd'
 #define NR_PAGE_FLIP 0xB0
 #define NR_DIRTYFB   0xB1
 #define NR_SETCRTC   0xA2
+#define NR_ATOMIC    0xBC
+#define ATOMIC_TEST_ONLY 0x0100u
+#define DRM_IOCTL_MODE_GETPROPERTY     _IOWR('d', 0xAA, struct drm_mode_get_property)
+#define DRM_IOCTL_MODE_GETPROPBLOB     _IOWR('d', 0xAC, struct drm_mode_get_blob)
+#define DRM_IOCTL_MODE_ATOMIC          _IOWR('d', 0xBC, struct drm_mode_atomic)
+#define DRM_IOCTL_MODE_CREATEPROPBLOB  _IOWR('d', 0xBD, struct drm_mode_create_blob)
+#define DRM_IOCTL_MODE_DESTROYPROPBLOB _IOWR('d', 0xBE, struct drm_mode_destroy_blob)
 #define DRM_IOCTL_GEM_CLOSE     _IOW('d', 0x09, struct drm_gem_close)
 #define DRM_IOCTL_MODE_DIRTYFB  _IOWR('d', 0xB1, struct drm_mode_fb_dirty_cmd)
 #define DRM_IOCTL_MODE_MAP_DUMB _IOWR('d', 0xB3, struct drm_mode_map_dumb)
@@ -73,8 +86,18 @@ static struct {
     struct mpc_sdraw_client *owner;
     int next_id;
     /* counters for the control interface */
-    unsigned long mpc_dirty, own_dirty, flips, dirty_err;
+    unsigned long mpc_dirty, own_dirty, flips, dirty_err, atomics;
     char err[96];
+    /* MPC Sample 1.4 presents with atomic commits (no DIRTYFB, no PAGE_FLIP; device, 2026-11-24): the plane and the property
+     * ids it sets, learnt from its commits, so the addin can refresh the same way when DIRTYFB is refused */
+    struct { uint32_t id; int kind; } props[32]; int nprops;   /* kind: 0 other, 1 FB_ID, 2 FB_DAMAGE_CLIPS */
+    uint32_t plane, prop_fb, prop_dmg;
+    int use_atomic;                /* our refreshes go out as atomic commits (DIRTYFB failed) */
+    /* What the owner last put on the glass. The panel is fed over SPI and every refreshed pixel goes through it: full
+     * 320x240 refreshes at a page's frame rate starved MPC's audio thread (344 -> 252 periods a second, device,
+     * 2026-11-24). present() sends only what changed since. */
+    uint32_t last[SDRAW_W * SDRAW_H]; int last_ok; unsigned long skipped;
+    long long ref_us_total, ref_us_max, mpc_wait_us_max;   /* time in our refresh ioctls; MPC's longest wait for the lock */
     /* the first 30 s of MPC's DRM ioctls by number, logged once: what MPC really calls */
     unsigned hist[256]; long long hist_t0; int hist_done;
     /* tests: a file stands in for the framebuffer, and refreshes are only counted */
@@ -186,18 +209,100 @@ static void copy(uint32_t *dst, int ds, const uint32_t *src, int ss, rect r)
     for (int y = r.y0; y < r.y1; y++) memcpy(dst + (size_t)y * ds + r.x0, src + (size_t)y * ss + r.x0, n);
 }
 
+/* Refresh r with an atomic commit on MPC's plane, as MPC Sample 1.4 does: FB_ID (the buffer on screen) and its damage. */
+static int refresh_atomic(rect r)
+{
+    if (!S.plane || !S.prop_fb) { snprintf(S.err, sizeof S.err, "atomic refresh: MPC's plane not seen yet"); return -1; }
+    struct drm_mode_rect dr = { r.x0, r.y0, r.x1, r.y1 };
+    struct drm_mode_create_blob cb = { .data = (uintptr_t)&dr, .length = sizeof dr };
+    int blob = S.prop_dmg && real_ioctl(S.fd, DRM_IOCTL_MODE_CREATEPROPBLOB, &cb) == 0;
+    uint32_t objs[1] = { S.plane }, counts[1] = { blob ? 2u : 1u }, ids[2] = { S.prop_fb, S.prop_dmg };
+    uint64_t vals[2] = { S.fb, blob ? cb.blob_id : 0 };
+    struct drm_mode_atomic a = { .count_objs = 1, .objs_ptr = (uintptr_t)objs, .count_props_ptr = (uintptr_t)counts,
+                                 .props_ptr = (uintptr_t)ids, .prop_values_ptr = (uintptr_t)vals };
+    int rc = real_ioctl(S.fd, DRM_IOCTL_MODE_ATOMIC, &a);
+    if (rc) snprintf(S.err, sizeof S.err, "atomic refresh: %s", strerror(errno));
+    if (blob) { struct drm_mode_destroy_blob db = { cb.blob_id }; real_ioctl(S.fd, DRM_IOCTL_MODE_DESTROYPROPBLOB, &db); }
+    return rc;
+}
+
 /* Refresh rectangle r of the panel on MPC's fd (lock held). */
+static long long now_us(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec * 1000000LL + t.tv_nsec / 1000; }
+static void refresh_raw(rect r);
 static void refresh(rect r)
+{
+    long long t0 = now_us();
+    refresh_raw(r);
+    long long d = now_us() - t0;
+    S.ref_us_total += d;
+    if (d > S.ref_us_max) S.ref_us_max = d;
+}
+static void refresh_raw(rect r)
 {
     if (empty(r)) return;
     S.own_dirty++;
     if (S.test_fb) return;
-    struct drm_clip_rect c = { (unsigned short)r.x0, (unsigned short)r.y0, (unsigned short)r.x1, (unsigned short)r.y1 };
-    struct drm_mode_fb_dirty_cmd d = { .fb_id = S.fb, .num_clips = 1, .clips_ptr = (uintptr_t)&c };
-    if (real_ioctl(S.fd, DRM_IOCTL_MODE_DIRTYFB, &d)) S.dirty_err++;
+    if (!S.use_atomic) {
+        struct drm_clip_rect c = { (unsigned short)r.x0, (unsigned short)r.y0, (unsigned short)r.x1, (unsigned short)r.y1 };
+        struct drm_mode_fb_dirty_cmd d = { .fb_id = S.fb, .num_clips = 1, .clips_ptr = (uintptr_t)&c };
+        if (real_ioctl(S.fd, DRM_IOCTL_MODE_DIRTYFB, &d) == 0) return;
+        if (!S.plane) { S.dirty_err++; return; }   /* MPC presents the old way: nothing else to try */
+        LOG("DIRTYFB refused (%s): refreshing with atomic commits on MPC's plane %u\n", strerror(errno), S.plane);
+        S.use_atomic = 1;
+    }
+    if (refresh_atomic(r)) S.dirty_err++;
 }
 
 static const rect FULL = { 0, 0, SDRAW_W, SDRAW_H };
+
+/* The part of r where layer differs from what the owner last put on screen (S.last): its bounding box, empty if none. */
+static rect changed(const uint32_t *layer, rect r)
+{
+    rect b = { r.x1, r.y1, r.x0, r.y0 };
+    for (int y = r.y0; y < r.y1; y++) {
+        const uint32_t *a = layer + (size_t)y * SDRAW_W, *o = S.last + (size_t)y * SDRAW_W;
+        int x0 = r.x0, x1 = r.x1;
+        while (x0 < x1 && a[x0] == o[x0]) x0++;
+        if (x0 == x1) continue;
+        while (x1 > x0 && a[x1 - 1] == o[x1 - 1]) x1--;
+        if (x0 < b.x0) b.x0 = x0;
+        if (x1 > b.x1) b.x1 = x1;
+        if (y < b.y0) b.y0 = y;
+        b.y1 = y + 1;
+    }
+    return b;
+}
+
+/* The changed parts of r (against S.last) as up to MAX_BANDS bands of rows, each its own bounding box. Rows that changed
+ * less than BAND_GAP rows apart share a band (a refresh has a fixed cost too); past MAX_BANDS the closest merge. */
+#define MAX_BANDS 6
+#define BAND_GAP 4
+static int bands(const uint32_t *layer, rect r, rect *b)
+{
+    int n = 0;
+    for (int y = r.y0; y < r.y1; y++) {
+        rect row = changed(layer, (rect){ r.x0, y, r.x1, y + 1 });
+        if (empty(row)) continue;
+        if (n && y - b[n - 1].y1 < BAND_GAP) {
+            rect *p = &b[n - 1];
+            if (row.x0 < p->x0) p->x0 = row.x0;
+            if (row.x1 > p->x1) p->x1 = row.x1;
+            p->y1 = y + 1;
+            continue;
+        }
+        if (n == MAX_BANDS) {   /* merge the two closest bands, then add this one */
+            int k = 0;
+            for (int i = 1; i + 1 < n; i++) if (b[i + 1].y0 - b[i].y1 < b[k + 1].y0 - b[k].y1) k = i;
+            if (b[k + 1].x0 < b[k].x0) b[k].x0 = b[k + 1].x0;
+            if (b[k + 1].x1 > b[k].x1) b[k].x1 = b[k + 1].x1;
+            b[k].y1 = b[k + 1].y1;
+            memmove(&b[k + 1], &b[k + 2], (size_t)(n - k - 2) * sizeof *b);
+            n--;
+        }
+        b[n++] = row;
+    }
+    return n;
+}
 
 /* MPC just drew rectangle r: keep its pixels, show the owner's (lock held). */
 static void cover(rect r)
@@ -222,6 +327,55 @@ static void note_hist(unsigned nr)
     for (int i = 0; i < 256 && n < (int)sizeof line - 16; i++)
         if (S.hist[i]) n += snprintf(line + n, sizeof line - n, " 0x%02X:%u", i, S.hist[i]);
     LOG("MPC's DRM ioctls in its first 30 s (number:count):%s\n", n ? line : " none");
+}
+
+/* What property id is (lock held): asked of the kernel by name once, then cached. Tests: 1001 is FB_ID, 1002 FB_DAMAGE_CLIPS. */
+static int prop_kind(int fd, uint32_t id)
+{
+    for (int i = 0; i < S.nprops; i++) if (S.props[i].id == id) return S.props[i].kind;
+    int kind = 0;
+    if (S.test_fb) kind = id == 1001 ? 1 : id == 1002 ? 2 : 0;
+    else {
+        struct drm_mode_get_property p;
+        memset(&p, 0, sizeof p);
+        p.prop_id = id;
+        if (real_ioctl(fd, DRM_IOCTL_MODE_GETPROPERTY, &p) == 0) {
+            p.name[sizeof p.name - 1] = 0;
+            kind = !strcmp(p.name, "FB_ID") ? 1 : !strcmp(p.name, "FB_DAMAGE_CLIPS") ? 2 : 0;
+        }
+    }
+    if (S.nprops < (int)(sizeof S.props / sizeof S.props[0])) S.props[S.nprops++] = (typeof(S.props[0])){ id, kind };
+    return kind;
+}
+
+/* MPC's atomic commit (lock held, before it goes out): a flip when it sets a plane's FB_ID, a refresh of its damage
+ * (FB_DAMAGE_CLIPS) otherwise. Returns the framebuffer it puts on screen, 0 for none. */
+static uint32_t on_mpc_atomic(int fd, const struct drm_mode_atomic *a)
+{
+    if (a->flags & ATOMIC_TEST_ONLY) return 0;
+    const uint32_t *objs = (const uint32_t *)(uintptr_t)a->objs_ptr, *counts = (const uint32_t *)(uintptr_t)a->count_props_ptr;
+    const uint32_t *ids = (const uint32_t *)(uintptr_t)a->props_ptr;
+    const uint64_t *vals = (const uint64_t *)(uintptr_t)a->prop_values_ptr;
+    if (!objs || !counts || !ids || !vals) return 0;
+    uint32_t fb = 0, dmg = 0;
+    for (uint32_t i = 0, k = 0; i < a->count_objs && i < 64; i++)
+        for (uint32_t j = 0; j < counts[i] && j < 64; j++, k++) {
+            int kind = prop_kind(fd, ids[k]);
+            if (kind == 1 && vals[k]) { fb = (uint32_t)vals[k]; S.plane = objs[i]; S.prop_fb = ids[k]; }
+            else if (kind == 2) { dmg = (uint32_t)vals[k]; S.prop_dmg = ids[k]; }
+        }
+    S.atomics++;
+    if (!fb && !S.px) return 0;
+    S.fd = fd;
+    if (fb) { S.flips++; if (map_fb(fb)) return 0; }
+    if (!S.owner) return fb;
+    struct drm_mode_rect r[16];
+    struct drm_mode_get_blob gb = { .blob_id = dmg, .length = sizeof r, .data = (uintptr_t)r };
+    int n = dmg && !S.test_fb && real_ioctl(fd, DRM_IOCTL_MODE_GETPROPBLOB, &gb) == 0 && gb.length <= sizeof r
+            ? (int)(gb.length / sizeof r[0]) : 0;
+    if (!n) cover(FULL);   /* no damage given: the whole frame */
+    for (int i = 0; i < n; i++) cover(clip(r[i].x1, r[i].y1, r[i].x2 - r[i].x1, r[i].y2 - r[i].y1));
+    return fb;
 }
 
 /* Before MPC's DRM ioctl goes out (lock held). */
@@ -256,6 +410,21 @@ __attribute__((visibility("default"))) int ioctl(int fd, unsigned long req, ...)
     resolve();
     if (((req >> 8) & 0xff) == DRM_TYPE && atomic_load_explicit(&S.on, memory_order_relaxed)) {
         unsigned nr = req & 0xff;
+        if (nr == NR_ATOMIC && arg) {
+            long long w0 = now_us();
+            pthread_mutex_lock(&S.mu);
+            if (now_us() - w0 > S.mpc_wait_us_max) S.mpc_wait_us_max = now_us() - w0;
+            note_hist(nr);
+            uint32_t fb = on_mpc_atomic(fd, arg);
+            pthread_mutex_unlock(&S.mu);
+            int r = real_ioctl(fd, req, arg);
+            if ((r == 0 || S.test_fb) && fb) {
+                pthread_mutex_lock(&S.mu);
+                after_flip(fb);
+                pthread_mutex_unlock(&S.mu);
+            }
+            return r;
+        }
         if (nr == NR_DIRTYFB || nr == NR_PAGE_FLIP || nr == NR_SETCRTC || !S.hist_done) {
             pthread_mutex_lock(&S.mu);
             on_mpc_drm(fd, nr, arg);
@@ -299,6 +468,7 @@ static int give(mpc_sdraw_client *c, int self, note *ns, int *n)
     handovers++;
     copy(S.px, S.pitch, c->layer, SDRAW_W, FULL);
     refresh(FULL);
+    memcpy(S.last, c->layer, sizeof S.last); S.last_ok = 1;
     if (prev && prev != c) ns[(*n)++] = (note){ prev, 0 };
     if (!self && prev != c) ns[(*n)++] = (note){ c, 1 };
     return 0;
@@ -308,6 +478,7 @@ static int give(mpc_sdraw_client *c, int self, note *ns, int *n)
 static void restore(void)
 {
     S.owner = NULL;
+    S.last_ok = 0;
     for (int i = 0; i < 4; i++) {
         struct sbuf *b = &S.buf[i];
         if (!b->px || !b->painted) continue;
@@ -394,8 +565,17 @@ static void api_present(mpc_sdraw_client *c, int x, int y, int w, int h)
     if (!c) return;
     pthread_mutex_lock(&S.mu);
     if (S.owner == c && S.px) {
-        rect r = clip(x, y, w, h);
-        if (!empty(r)) { copy(S.px, S.pitch, c->layer, SDRAW_W, r); refresh(r); }
+        rect r = clip(x, y, w, h), b[MAX_BANDS];
+        /* Only what differs from the glass, as bands of rows refreshed one by one: the panel driver merges the clips of
+         * one refresh into their bounding box, so two changed list rows far apart would send everything between. */
+        int nb = empty(r) ? 0 : S.last_ok ? bands(c->layer, r, b) : (b[0] = r, 1);
+        if (!nb) S.skipped++;
+        for (int i = 0; i < nb; i++) {
+            copy(S.px, S.pitch, c->layer, SDRAW_W, b[i]);
+            refresh(b[i]);
+            copy(S.last, SDRAW_W, c->layer, SDRAW_W, b[i]);
+        }
+        S.last_ok = 1;
     }
     pthread_mutex_unlock(&S.mu);
 }
@@ -438,25 +618,48 @@ void sdraw_deliver(const mpc_sdraw_event *e)
     pthread_mutex_unlock(&deliver_mu);
 }
 
-static int api_show(mpc_sdraw_client *c, const char *name)
+/* Give the screen to the client found by name (the newest with it) or, name NULL, by id; c gets it back on the page button. */
+static int show_client(mpc_sdraw_client *c, const char *name, int id)
 {
-    if (!c || !name) return -1;
+    if (!c || (!name && id <= 0)) return -1;
     note ns[2]; int n = 0, r = -1;
     pthread_mutex_lock(&S.mu);
     mpc_sdraw_client *t = NULL;
-    for (int i = 0; i < SDRAW_MAX_CLIENTS; i++)
-        if (S.cl[i] && S.cl[i] != c && !strcmp(S.cl[i]->name, name) && (!t || S.cl[i]->id > t->id)) t = S.cl[i];
+    for (int i = 0; i < SDRAW_MAX_CLIENTS; i++) {
+        mpc_sdraw_client *x = S.cl[i];
+        if (!x || x == c) continue;
+        if (name ? !strcmp(x->name, name) && (!t || x->id > t->id) : x->id == id) t = x;
+    }
     if (t && give(t, 0, ns, &n) == 0) { t->back = c->id; r = 0; }
     pthread_mutex_unlock(&S.mu);
     tell(ns, n);
     return r;
 }
 
+static int api_show(mpc_sdraw_client *c, const char *name) { return name ? show_client(c, name, 0) : -1; }
+static int api_show_id(mpc_sdraw_client *c, int id) { return show_client(c, NULL, id); }
+
+static int api_list(mpc_sdraw_client *c, mpc_sdraw_info *out, int max)
+{
+    int k = 0;
+    pthread_mutex_lock(&S.mu);
+    for (int want = 0;;) {   /* oldest first: ascending ids */
+        mpc_sdraw_client *next = NULL;
+        for (int i = 0; i < SDRAW_MAX_CLIENTS; i++)
+            if (S.cl[i] && S.cl[i] != c && S.cl[i]->id > want && (!next || S.cl[i]->id < next->id)) next = S.cl[i];
+        if (!next) break;
+        if (out && k < max) { out[k].id = next->id; snprintf(out[k].name, sizeof out[k].name, "%s", next->name); }
+        k++; want = next->id;
+    }
+    pthread_mutex_unlock(&S.mu);
+    return k;
+}
+
 static const mpc_sdraw_api API = {
     .version = MPC_SDRAW_API_VERSION, .width = SDRAW_W, .height = SDRAW_H,
     .open = api_open, .close = api_close, .request = api_request, .release = api_release,
     .has_screen = api_has_screen, .pixels = api_pixels, .present = api_present, .set_input = api_set_input,
-    .show = api_show,
+    .show = api_show, .list = api_list, .show_id = api_show_id,
 };
 
 __attribute__((visibility("default"))) const mpc_sdraw_api *mpc_sample_draw_api(int version)
@@ -550,8 +753,8 @@ int sdraw_status_json(char *out, size_t n)
     pthread_mutex_lock(&S.mu);
     PUT("{\"version\":\"%s\",\"display\":{\"fd\":%d,\"fb\":%u,\"mapped\":%s,\"error\":", ADDIN_VERSION, S.fd, S.fb, S.px ? "true" : "false");
     jstr(out, n, &k, S.err);
-    PUT("},\"refreshes\":{\"mpc\":%lu,\"ours\":%lu,\"ours_failed\":%lu,\"page_flips\":%lu},\"owner\":%d,\"clients\":[",
-        S.mpc_dirty, S.own_dirty, S.dirty_err, S.flips, S.owner ? S.owner->id : 0);
+    PUT("},\"refreshes\":{\"mpc\":%lu,\"ours\":%lu,\"ours_failed\":%lu,\"page_flips\":%lu,\"atomic\":%lu,\"ours_atomic\":%s,\"unchanged\":%lu,\"refresh_ms_total\":%lld,\"refresh_ms_max\":%lld,\"mpc_wait_ms_max\":%lld},\"owner\":%d,\"clients\":[",
+        S.mpc_dirty, S.own_dirty, S.dirty_err, S.flips, S.atomics, S.use_atomic ? "true" : "false", S.skipped, S.ref_us_total / 1000, S.ref_us_max / 1000, S.mpc_wait_us_max / 1000, S.owner ? S.owner->id : 0);
     int first = 1;
     for (int i = 0; i < SDRAW_MAX_CLIENTS; i++) {
         if (!S.cl[i]) continue;

@@ -38,7 +38,20 @@ static void on_input(void *u, const mpc_sdraw_event *e) { (void)u; if (n_in < 16
 
 struct drm_mode_crtc_page_flip { unsigned crtc_id, fb_id, flags, reserved; unsigned long long user_data; };
 #define PAGE_FLIP _IOWR('d', 0xB0, struct drm_mode_crtc_page_flip)
-static void mpc_flip(unsigned id) { struct drm_mode_crtc_page_flip pf = { .fb_id = id }; ioctl(dfd, PAGE_FLIP, &pf); }
+struct drm_mode_atomic { unsigned flags, count_objs; unsigned long long objs_ptr, count_props_ptr, props_ptr, prop_values_ptr, reserved, user_data; };
+#define ATOMIC _IOWR('d', 0xBC, struct drm_mode_atomic)
+static int atomic_mode;   /* MPC Sample 1.4: flips are atomic commits setting the plane's FB_ID (test property id 1001) */
+static void mpc_flip(unsigned id)
+{
+    if (!atomic_mode) { struct drm_mode_crtc_page_flip pf = { .fb_id = id }; ioctl(dfd, PAGE_FLIP, &pf); return; }
+    unsigned objs[2] = { 40, 50 }, counts[2] = { 1, 2 }, ids[3] = { 7, 1001, 1002 };   /* a CRTC property, then the plane */
+    unsigned long long vals[3] = { 1, id, 0 };
+    struct drm_mode_atomic t = { .flags = 0x0100, .count_objs = 2, .objs_ptr = (unsigned long)objs, .count_props_ptr = (unsigned long)counts,
+                                 .props_ptr = (unsigned long)ids, .prop_values_ptr = (unsigned long)vals };
+    vals[1] = 99; ioctl(dfd, ATOMIC, &t);      /* a TEST_ONLY commit first, as libdrm users do: never a flip */
+    vals[1] = id; t.flags = 0x0200;            /* then the real one, nonblocking */
+    ioctl(dfd, ATOMIC, &t);
+}
 static unsigned *map_file(const char *path) { int f = open(path, O_RDWR); return f < 0 ? NULL : mmap(NULL, W * H * 4, PROT_READ | PROT_WRITE, MAP_SHARED, f, 0); }
 static int has(const unsigned *b, unsigned col) { for (int i = 0; i < W * H; i++) if (b[i] == col) return 1; return 0; }
 
@@ -75,7 +88,8 @@ static int flip_test(const mpc_sdraw_api *A, const char *pat)
 
 int main(int argc, char **argv)
 {
-    if (argc > 1 && !strcmp(argv[1], "flip")) {
+    if (argc > 1 && (!strcmp(argv[1], "flip") || !strcmp(argv[1], "atomic"))) {
+        atomic_mode = !strcmp(argv[1], "atomic");
         int p[2]; pipe(p); dfd = p[0];
         const mpc_sdraw_api *(*g)(int) = (const mpc_sdraw_api *(*)(int))dlsym(RTLD_DEFAULT, MPC_SDRAW_ENTRY);
         const mpc_sdraw_api *A = g ? g(MPC_SDRAW_API_VERSION) : NULL;
@@ -189,6 +203,21 @@ int main(int argc, char **argv)
         FR(0, 0x80, 0, 0x00); write(s2, fr, 32); read(s2, rf, sizeof rf);
         CHECK(A->has_screen(cb), "from A it cycles on as usual (to B)");
         A->close(cc);
+        {   /* version 4: a plugin MPC runs twice (a pad's Knob FX): two pages with one name, told apart by id */
+            mpc_sdraw_client *k1 = A->open("plugin K", NULL, NULL), *k2 = A->open("plugin K", NULL, NULL);
+            mpc_sdraw_info li[8];
+            int nl = A->version >= 4 && A->list ? A->list(ca, li, 8) : -1, ks = 0, self = 0, asc = 1;
+            for (int i = 0; i < nl && i < 8; i++) { ks += !strcmp(li[i].name, "plugin K"); if (i && li[i].id <= li[i - 1].id) asc = 0; }
+            (void)self;
+            CHECK(nl >= 3 && ks == 2 && asc, "list: the other clients, oldest first, both of a twice-run plugin");
+            int seen_a = 0; for (int i = 0; i < nl && i < 8; i++) seen_a |= !strcmp(li[i].name, "plugin A");
+            CHECK(!seen_a, "list leaves out the client that asks");
+            CHECK(A->list(ca, li, 1) == nl, "list with a short array still says how many");
+            int id1 = 0; for (int i = 0; i < nl && i < 8; i++) if (!strcmp(li[i].name, "plugin K")) { id1 = li[i].id; break; }
+            CHECK(A->show_id(ca, id1) == 0 && A->has_screen(k1) && !A->has_screen(k2), "show_id opens the older of the two, not the newest");
+            CHECK(A->show_id(ca, 9999) == -1 && A->has_screen(k1), "show_id of an unknown id fails, the screen stays");
+            A->close(k1); A->close(k2);
+        }
         A->release(cb);
         A->request(ca);
         A->release(ca);
