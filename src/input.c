@@ -52,7 +52,8 @@ void input_controls(const int keys[4], const int knobs[3], int dial)
 }
 static pthread_cond_t ev_cond = PTHREAD_COND_INITIALIZER;
 static mpc_sdraw_event evq[64]; static int nev;
-static int knob_at[3] = { -1, -1, -1 };   /* every knob's last position, seen whoever has the screen */
+static int knob_at[3] = { -1, -1, -1 };
+static unsigned char key_taken[4];        /* the key's press went to the client with the screen (its release follows) */   /* every knob's last position, seen whoever has the screen */
 
 /* The client taking input changed (lock held): tell the new one where the knobs are, before anything else it gets. */
 static int last_owner; static unsigned last_gen;
@@ -79,12 +80,24 @@ static int take(const unsigned char *m)
     unsigned gen; int owner = sdraw_input_owner(&gen);
     owner_check(owner, gen);   /* before this message changes knob_at: the report is where the knob was */
     see_knob(m);
-    if (!owner) return 0;
     mpc_sdraw_event e = { 0, 0, 0 };
     int kind = m[0] & 0xF0;
     if (kind == 0x90 || kind == 0x80) {
+        /* A key's release goes where its press went, whoever has the screen by then: a page that takes the screen on
+         * MPC's press (or gives it back on its own) would otherwise leave MPC with a key held down that never comes up
+         * (MPC then ignores that key's next press), or hand MPC a release it never saw pressed. */
         for (int i = 0; i < 4; i++)   /* 3: the dial pressed in */
-            if (key_note[i] >= 0 && m[1] == key_note[i]) { e.type = MPC_SDRAW_EV_KEY; e.id = i; e.value = kind == 0x90 && m[2]; }
+            if (key_note[i] >= 0 && m[1] == key_note[i]) {
+                int down = kind == 0x90 && m[2];
+                if (down) key_taken[i] = owner != 0;
+                else if (!key_taken[i]) return 0;
+                else key_taken[i] = 0;
+                if (!owner) return !down;   /* a taken press's release, after the screen went back: dropped */
+                e.type = MPC_SDRAW_EV_KEY; e.id = i; e.value = down;
+            }
+        if (!e.type && !owner) return 0;
+    } else if (!owner) {
+        return 0;
     } else if (kind == 0xB0) {
         if (dial_cc >= 0 && m[1] == dial_cc) { e.type = MPC_SDRAW_EV_DIAL; e.value = m[2] < 64 ? m[2] : m[2] - 128; }
         for (int i = 0; i < 3; i++)

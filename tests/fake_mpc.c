@@ -223,6 +223,16 @@ int main(int argc, char **argv)
         A->release(ca);
         FR(0, 0x90, 12, 0x7F); write(s2, fr, 32);
         CHECK(read(s2, rf, sizeof rf) == 32 && rf[17] == 12, "without the screen, the soft key goes to MPC");
+        A->request(ca);   /* a page takes the screen on that press (as one does on MPC's Load Kit) */
+        FR(0, 0x80, 12, 0x00); write(s2, fr, 32);
+        CHECK(read(s2, rf, sizeof rf) == 32 && rf[16] == 0x80 && rf[17] == 12, "the release of a press MPC got goes to MPC, page or not");
+        FR(0, 0x90, 12, 0x7F); write(s2, fr, 32);   /* the page's own press: taken */
+        FR(0, 0x90, 40, 0x7F); write(s2, fr, 32);
+        CHECK(read(s2, rf, sizeof rf) == 32 && rf[17] == 40, "with the screen, the soft key goes to the page");
+        A->release(ca);   /* the page gives the screen back on its press (LOAD) */
+        FR(0, 0x80, 12, 0x00); write(s2, fr, 32);
+        FR(0, 0x90, 41, 0x7F); write(s2, fr, 32);
+        CHECK(read(s2, rf, sizeof rf) == 32 && rf[17] == 41, "the release of the page's press doesn't reach MPC after the page let go");
         /* with the home page (RACK) open, the page button toggles it, and a page it showed goes back to it */
         A->release(ca); A->release(cb);
         mpc_sdraw_client *rk = A->open("RACK", fa, NULL);
